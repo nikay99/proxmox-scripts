@@ -1,21 +1,43 @@
 {
-  "$schema": "https://opencode.ai/config.json",
-  "autoupdate": false,
-  "permission": {
-    "bash": {
-      "*": "allow",
-      "rm -rf *": "ask",
-      "rm -r *": "ask",
-      "sudo rm *": "ask",
-      "sudo shutdown *": "ask",
-      "sudo reboot *": "ask",
-      "sudo passwd *": "ask",
-      "sudo deluser *": "ask",
-      "sudo userdel *": "ask"
-    },
-    "edit": "allow",
-    "read": "allow",
-    "write": "allow",
-    "webfetch": "allow"
+  "$meta": { "version": 1 },
+  "database": {
+    "mode": "embedded-postgres",
+    "embeddedPostgresDataDir": "/home/paper/.paperclip/instances/default/db",
+    "embeddedPostgresPort": 54329,
+    "backup": {
+      "enabled": true,
+      "intervalMinutes": 60,
+      "retentionDays": 30,
+      "dir": "/home/paper/.paperclip/instances/default/data/backups"
+    }
+  },
+  "logging": {
+    "mode": "file",
+    "logDir": "/home/paper/.paperclip/instances/default/logs"
+  },
+  "server": {
+    "deploymentMode": "authenticated",
+    "exposure": "private",
+    "host": "0.0.0.0",
+    "port": 3100,
+    "allowedHostnames": ["127.0.0.1"],
+    "serveUi": true
+  },
+  "auth": {
+    "baseUrlMode": "auto",
+    "disableSignUp": false
+  },
+  "storage": {
+    "provider": "local_disk",
+    "localDisk": {
+      "baseDir": "/home/paper/.paperclip/instances/default/data/storage"
+    }
+  },
+  "secrets": {
+    "provider": "local_encrypted",
+    "strictMode": false,
+    "localEncrypted": {
+      "keyFilePath": "/home/paper/.paperclip/instances/default/secrets/master.key"
+    }
   }
 }
