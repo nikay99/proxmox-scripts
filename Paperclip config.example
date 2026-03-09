@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "rm -rf *": "ask",
+      "rm -r *": "ask",
+      "sudo rm *": "ask",
+      "sudo shutdown *": "ask",
+      "sudo reboot *": "ask",
+      "sudo passwd *": "ask",
+      "sudo deluser *": "ask",
+      "sudo userdel *": "ask"
+    },
+    "edit": "allow",
+    "read": "allow",
+    "write": "allow",
+    "webfetch": "allow"
+  }
+}
