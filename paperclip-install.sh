@@ -67,63 +67,75 @@ qm set "$VMID" --ciuser "$CI_USER"
 qm set "$VMID" --cipassword "$CI_PASSWORD"
 qm set "$VMID" --ciupgrade 0
 
-# Cloud-init user-data Script
-echo "[5/7] Writing cloud-init user-data..."
-
-ALLOWED_HOSTNAMES="\"127.0.0.1\""
+# Allowed hostnames für config.json
+ALLOWED_HOSTNAMES='"127.0.0.1"'
 if [ -n "$PUBLIC_HOST" ]; then
-  ALLOWED_HOSTNAMES="\"127.0.0.1\", \"$PUBLIC_HOST\""
+  ALLOWED_HOSTNAMES='"127.0.0.1", "'"$PUBLIC_HOST"'"'
 fi
 
-cat > /tmp/paperclip-userdata.yml << USERDATA
-#cloud-config
-package_update: false
-package_upgrade: false
+echo "[5/7] Writing cloud-init user-data..."
+mkdir -p /var/lib/vz/snippets/
 
-write_files:
-  - path: /root/paperclip-setup.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      set -e
-      LOG=/root/paperclip-install-result.txt
-      exec > >(tee -a \$LOG) 2>&1
+# Setup script separat schreiben
+cat > /tmp/paperclip-setup-$VMID.sh << SETUP
+#!/bin/bash
+set -e
+LOG=/root/paperclip-install-result.txt
+exec > >(tee -a \$LOG) 2>&1
 
-      echo "==== PAPERCLIP INSTALL START ===="
-      echo "Date: \$(date)"
+echo "==== PAPERCLIP INSTALL START ===="
+echo "Date: \$(date)"
 
-      # Node.js 22
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-      apt-get install -y nodejs git curl
+# paper user anlegen
+id paper 2>/dev/null || useradd -m -s /bin/bash paper
+echo "paper:${CI_PASSWORD}" | chpasswd
 
-      # pnpm
-      corepack enable
-      corepack prepare pnpm@latest --activate
+# sudo ohne passwort fuer paper (volle rechte)
+echo "paper ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/paper
+chmod 440 /etc/sudoers.d/paper
 
-      # paper user
-      id paper 2>/dev/null || useradd -m -s /bin/bash paper
-      echo "paper:${CI_PASSWORD}" | chpasswd
+# Node.js 22
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs git curl
 
-      # Paperclip clonen
-      sudo -u paper git clone https://github.com/paperclipai/paperclip /home/paper/paperclip-src
-      cd /home/paper/paperclip-src
-      sudo -u paper pnpm install --frozen-lockfile
+# pnpm
+corepack enable
+corepack prepare pnpm@latest --activate
 
-      # Verzeichnisse anlegen
-      sudo -u paper mkdir -p /home/paper/.paperclip/instances/default/{db,data/backups,data/storage,logs,secrets}
-      sudo -u paper mkdir -p /home/paper/workdir
+# opencode 1.2.22 installieren
+npm install -g opencode-ai@1.2.22
 
-      # .env mit Secrets
-      cat > /home/paper/.paperclip/instances/default/.env << ENV
+# opencode config - alle permissions allow, kein autoupdate
+mkdir -p /home/paper/.config/opencode
+cat > /home/paper/.config/opencode/opencode.json << 'OPENCODE_CFG'
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "permission": "allow",
+  "autoupdate": false
+}
+OPENCODE_CFG
+chown -R paper:paper /home/paper/.config
+
+# Paperclip clonen
+sudo -u paper git clone https://github.com/paperclipai/paperclip /home/paper/paperclip-src
+cd /home/paper/paperclip-src
+sudo -u paper pnpm install --frozen-lockfile
+
+# Verzeichnisse anlegen
+sudo -u paper mkdir -p /home/paper/.paperclip/instances/default/{db,data/backups,data/storage,logs,secrets}
+sudo -u paper mkdir -p /home/paper/million/{agents,projects}
+
+# .env mit Secrets
+cat > /home/paper/.paperclip/instances/default/.env << ENV
 BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
 NODE_ENV=production
 PAPERCLIP_HOME=/home/paper/.paperclip
 ENV
-      chown paper:paper /home/paper/.paperclip/instances/default/.env
-      chmod 600 /home/paper/.paperclip/instances/default/.env
+chown paper:paper /home/paper/.paperclip/instances/default/.env
+chmod 600 /home/paper/.paperclip/instances/default/.env
 
-      # config.json
-      cat > /home/paper/.paperclip/instances/default/config.json << CONFIG
+# paperclip config.json
+cat > /home/paper/.paperclip/instances/default/config.json << CONFIG
 {
   "\$meta": { "version": 1, "updatedAt": "\$(date -u +%Y-%m-%dT%H:%M:%S.000Z)", "source": "install" },
   "database": {
@@ -168,10 +180,10 @@ ENV
   }
 }
 CONFIG
-      chown paper:paper /home/paper/.paperclip/instances/default/config.json
+chown paper:paper /home/paper/.paperclip/instances/default/config.json
 
-      # systemd service
-      cat > /etc/systemd/system/paperclip.service << SERVICE
+# systemd service
+cat > /etc/systemd/system/paperclip.service << SERVICE
 [Unit]
 Description=Paperclip
 After=network-online.target
@@ -195,24 +207,42 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 SERVICE
 
-      systemctl daemon-reload
-      systemctl enable paperclip
-      systemctl start paperclip
+# Alle rechte fuer paper
+chown -R paper:paper /home/paper/
+chmod -R 755 /home/paper/million
 
-      echo ""
-      echo "==== PAPERCLIP INSTALL COMPLETE ===="
-      echo "User:   paper"
-      echo "Pass:   ${CI_PASSWORD}"
-      echo "Port:   ${PORT}"
-      echo "URL:    http://\$(hostname -I | awk '{print \$1}'):${PORT}"
+systemctl daemon-reload
+systemctl enable paperclip
+systemctl start paperclip
+
+echo ""
+echo "==== PAPERCLIP INSTALL COMPLETE ===="
+echo "User:     paper"
+echo "Password: ${CI_PASSWORD}"
+echo "URL:      http://\$(hostname -I | awk '{print \$1}'):${PORT}"
+echo "Sudo:     NOPASSWD (volle rechte)"
+SETUP
+
+cp /tmp/paperclip-setup-$VMID.sh /var/lib/vz/snippets/paperclip-setup-$VMID.sh
+
+# Cloud-init userdata
+cat > "/var/lib/vz/snippets/paperclip-userdata-$VMID.yml" << USERDATA
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /root/paperclip-setup.sh
+    permissions: '0755'
+    source:
+      encoding: b64
+      content: $(base64 -w0 /tmp/paperclip-setup-$VMID.sh)
 
 runcmd:
   - bash /root/paperclip-setup.sh
 USERDATA
 
 qm set "$VMID" --cicustom "user=local:snippets/paperclip-userdata-$VMID.yml"
-mkdir -p /var/lib/vz/snippets/
-cp /tmp/paperclip-userdata.yml "/var/lib/vz/snippets/paperclip-userdata-$VMID.yml"
 
 # VM starten
 echo "[6/7] Starting VM..."
@@ -221,14 +251,15 @@ qm start "$VMID"
 echo "[7/7] Done!"
 echo ""
 echo "========================================"
-echo " VM $VMID ($VMNAME) gestartet"
-echo " Cloud-init läuft im Hintergrund (~3-5 Min)"
+echo " VM $VMID ($VMNAME) gestartet!"
+echo " Cloud-init laeuft ~8-10 Min im Hintergrund"
 echo ""
-echo " Status prüfen:"
+echo " Status pruefen (nach ~10 Min):"
 echo "   qm guest exec $VMID -- cat /root/paperclip-install-result.txt"
 echo ""
-echo " Console öffnen:"
+echo " Console:"
 echo "   qm terminal $VMID"
+echo ""
+echo " Paperclip URL (nach Install):"
+echo "   http://<VM-IP>:${PORT}"
 echo "========================================"
-
- 
