@@ -19,7 +19,7 @@ Deploys a fully configured Paperclip instance in ~10 minutes — including openc
 
 ```bash
 # Clone or download the script to your Proxmox host
-wget -O paperclip-install.sh https://raw.githubusercontent.com/YOUR_USERNAME/paperclip-proxmox/main/paperclip-install.sh
+wget -O paperclip-install.sh https://raw.githubusercontent.com/nikay99/proxmox-scripts/refs/heads/main/paperclip-install.sh
 chmod +x paperclip-install.sh
 
 # Run with defaults (DHCP, VMID 9001, local-lvm)
