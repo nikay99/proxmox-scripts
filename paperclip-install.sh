@@ -1,11 +1,12 @@
 #!/bin/bash
-set -e
+# ─────────────────────────────────────────────────────────────
+# paperclip-install.sh
+# Deploys a Paperclip AI Ubuntu 24.04 VM on a Proxmox host
+# Run this on the Proxmox HOST, not inside the VM
+# ─────────────────────────────────────────────────────────────
+set -euo pipefail
 
-# ─────────────────────────────────────────────
-# PAPERCLIP UBUNTU 24.04 VM - PROXMOX INSTALL
-# Läuft auf dem Proxmox HOST (nicht in der VM)
-# ─────────────────────────────────────────────
-
+# ── Configuration (override via env vars) ────────────────────
 VMID="${VMID:-9001}"
 VMNAME="${VMNAME:-paperclip}"
 STORAGE="${STORAGE:-local-lvm}"
@@ -15,32 +16,60 @@ CORES="${CORES:-4}"
 MEMORY="${MEMORY:-8192}"
 DISK_SIZE="${DISK_SIZE:-40G}"
 CI_USER="${CI_USER:-paper}"
-CI_PASSWORD="${CI_PASSWORD:-Test1234}"
+CI_PASSWORD="${CI_PASSWORD:-$(openssl rand -base64 16)}"
 IPCONFIG0="${IPCONFIG0:-dhcp}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 PORT="${PORT:-3100}"
+OPENCODE_VERSION="${OPENCODE_VERSION:-1.2.22}"
 
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 IMAGE_PATH="/tmp/ubuntu-2404-cloud.img"
-BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
 
-echo "======================================"
-echo " PAPERCLIP VM INSTALLER"
-echo " VMID:    $VMID"
-echo " Name:    $VMNAME"
-echo " Storage: $STORAGE"
-echo " IP:      $IPCONFIG0"
-echo "======================================"
+# ── Preflight checks ─────────────────────────────────────────
+if ! command -v qm &>/dev/null; then
+  echo "ERROR: This script must be run on a Proxmox host." >&2
+  exit 1
+fi
 
-# Cloud Image downloaden
+if qm status "$VMID" &>/dev/null; then
+  echo "ERROR: VM $VMID already exists. Choose a different VMID." >&2
+  exit 1
+fi
+
+if ! pvesm status | grep -q "^$STORAGE "; then
+  echo "ERROR: Storage '$STORAGE' not found. Available:" >&2
+  pvesm status | awk 'NR>1 {print "  " $1}' >&2
+  exit 1
+fi
+
+# ── Summary ──────────────────────────────────────────────────
+echo "════════════════════════════════════════"
+echo "  PAPERCLIP VM INSTALLER"
+echo "════════════════════════════════════════"
+echo "  VMID       : $VMID"
+echo "  Name       : $VMNAME"
+echo "  Storage    : $STORAGE"
+echo "  Cores      : $CORES"
+echo "  Memory     : ${MEMORY}MB"
+echo "  Disk       : $DISK_SIZE"
+echo "  IP         : $IPCONFIG0"
+echo "  Port       : $PORT"
+echo "  User       : $CI_USER"
+echo "  Public host: ${PUBLIC_HOST:-none}"
+echo "════════════════════════════════════════"
+read -rp "Continue? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+# ── Download cloud image ──────────────────────────────────────
 if [ ! -f "$IMAGE_PATH" ]; then
   echo "[1/7] Downloading Ubuntu 24.04 cloud image..."
   wget -q --show-progress "$IMAGE_URL" -O "$IMAGE_PATH"
 else
-  echo "[1/7] Cloud image already exists, skipping download."
+  echo "[1/7] Cloud image already cached at $IMAGE_PATH"
 fi
 
-# VM erstellen
+# ── Create VM ────────────────────────────────────────────────
 echo "[2/7] Creating VM $VMID..."
 qm create "$VMID" \
   --name "$VMNAME" \
@@ -52,106 +81,123 @@ qm create "$VMID" \
   --agent enabled=1 \
   --ostype l26
 
-# Disk importieren
+# ── Import disk ───────────────────────────────────────────────
 echo "[3/7] Importing disk..."
-qm importdisk "$VMID" "$IMAGE_PATH" "$STORAGE"
+qm importdisk "$VMID" "$IMAGE_PATH" "$STORAGE" -format qcow2
 qm set "$VMID" --scsihw virtio-scsi-pci --scsi0 "$STORAGE:vm-$VMID-disk-0"
 qm resize "$VMID" scsi0 "$DISK_SIZE"
 qm set "$VMID" --boot order=scsi0
 
-# Cloud-init
+# ── Cloud-init base config ────────────────────────────────────
 echo "[4/7] Configuring cloud-init..."
-qm set "$VMID" --ide2 "$CISTORAGE:cloudinit"
-qm set "$VMID" --ipconfig0 "$IPCONFIG0"
-qm set "$VMID" --ciuser "$CI_USER"
-qm set "$VMID" --cipassword "$CI_PASSWORD"
-qm set "$VMID" --ciupgrade 0
+qm set "$VMID" \
+  --ide2 "$CISTORAGE:cloudinit" \
+  --ipconfig0 "$IPCONFIG0" \
+  --ciuser "$CI_USER" \
+  --cipassword "$CI_PASSWORD" \
+  --ciupgrade 0
 
-# Allowed hostnames für config.json
+# ── Build allowed hostnames list ──────────────────────────────
 ALLOWED_HOSTNAMES='"127.0.0.1"'
 if [ -n "$PUBLIC_HOST" ]; then
   ALLOWED_HOSTNAMES='"127.0.0.1", "'"$PUBLIC_HOST"'"'
 fi
 
+# ── Write setup script ────────────────────────────────────────
 echo "[5/7] Writing cloud-init user-data..."
 mkdir -p /var/lib/vz/snippets/
 
-# Setup script separat schreiben
-cat > /tmp/paperclip-setup-$VMID.sh << SETUP
+cat > /tmp/paperclip-setup-"$VMID".sh << SETUP
 #!/bin/bash
-set -e
+set -euo pipefail
 LOG=/root/paperclip-install-result.txt
-exec > >(tee -a \$LOG) 2>&1
+exec > >(tee -a "\$LOG") 2>&1
 
 echo "==== PAPERCLIP INSTALL START ===="
-echo "Date: \$(date)"
+echo "Date: \$(date -u)"
 
-# paper user anlegen
-id paper 2>/dev/null || useradd -m -s /bin/bash paper
-echo "paper:${CI_PASSWORD}" | chpasswd
+# ── User ──────────────────────────────────────────────────────
+id ${CI_USER} 2>/dev/null || useradd -m -s /bin/bash ${CI_USER}
+echo "${CI_USER}:${CI_PASSWORD}" | chpasswd
 
-# sudo ohne passwort fuer paper (volle rechte)
-echo "paper ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/paper
-chmod 440 /etc/sudoers.d/paper
+# sudo NOPASSWD for paper (agents need full control)
+echo "${CI_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${CI_USER}
+chmod 440 /etc/sudoers.d/${CI_USER}
 
-# Node.js 22
+# ── Dependencies ──────────────────────────────────────────────
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs git curl
+apt-get install -y nodejs git curl ca-certificates
 
-# pnpm
 corepack enable
 corepack prepare pnpm@latest --activate
 
-# opencode 1.2.22 installieren
-npm install -g opencode-ai@1.2.22
+# ── opencode ${OPENCODE_VERSION} ──────────────────────────────
+npm install -g opencode-ai@${OPENCODE_VERSION}
 
-# opencode config - alle permissions allow, kein autoupdate
-mkdir -p /home/paper/.config/opencode
-cat > /home/paper/.config/opencode/opencode.json << 'OPENCODE_CFG'
+# opencode config: ask before rm/sudo, allow everything else
+mkdir -p /home/${CI_USER}/.config/opencode
+cat > /home/${CI_USER}/.config/opencode/opencode.json << 'OPENCODE_CFG'
 {
   "\$schema": "https://opencode.ai/config.json",
-  "permission": "allow",
-  "autoupdate": false
+  "autoupdate": false,
+  "permission": {
+    "bash": {
+      "*": "allow",
+      "rm -rf *": "ask",
+      "rm -r *": "ask",
+      "sudo rm *": "ask",
+      "sudo shutdown *": "ask",
+      "sudo reboot *": "ask",
+      "sudo passwd *": "ask",
+      "sudo deluser *": "ask",
+      "sudo userdel *": "ask"
+    },
+    "edit": "allow",
+    "read": "allow",
+    "write": "allow",
+    "webfetch": "allow"
+  }
 }
 OPENCODE_CFG
-chown -R paper:paper /home/paper/.config
+chown -R ${CI_USER}:${CI_USER} /home/${CI_USER}/.config
 
-# Paperclip clonen
-sudo -u paper git clone https://github.com/paperclipai/paperclip /home/paper/paperclip-src
-cd /home/paper/paperclip-src
-sudo -u paper pnpm install --frozen-lockfile
+# ── Paperclip ────────────────────────────────────────────────
+sudo -u ${CI_USER} git clone https://github.com/paperclipai/paperclip /home/${CI_USER}/paperclip-src
+cd /home/${CI_USER}/paperclip-src
+sudo -u ${CI_USER} pnpm install --frozen-lockfile
 
-# Verzeichnisse anlegen
-sudo -u paper mkdir -p /home/paper/.paperclip/instances/default/{db,data/backups,data/storage,logs,secrets}
-sudo -u paper mkdir -p /home/paper/million/{agents,projects}
+# ── Directories ───────────────────────────────────────────────
+sudo -u ${CI_USER} mkdir -p \
+  /home/${CI_USER}/.paperclip/instances/default/{db,data/backups,data/storage,logs,secrets} \
+  /home/${CI_USER}/million/{agents,projects}
 
-# .env mit Secrets
-cat > /home/paper/.paperclip/instances/default/.env << ENV
+# ── .env ─────────────────────────────────────────────────────
+cat > /home/${CI_USER}/.paperclip/instances/default/.env << ENV
 BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
 NODE_ENV=production
-PAPERCLIP_HOME=/home/paper/.paperclip
+PAPERCLIP_HOME=/home/${CI_USER}/.paperclip
 ENV
-chown paper:paper /home/paper/.paperclip/instances/default/.env
-chmod 600 /home/paper/.paperclip/instances/default/.env
+chown ${CI_USER}:${CI_USER} /home/${CI_USER}/.paperclip/instances/default/.env
+chmod 600 /home/${CI_USER}/.paperclip/instances/default/.env
 
-# paperclip config.json
-cat > /home/paper/.paperclip/instances/default/config.json << CONFIG
+# ── Paperclip config.json ────────────────────────────────────
+cat > /home/${CI_USER}/.paperclip/instances/default/config.json << CONFIG
 {
   "\$meta": { "version": 1, "updatedAt": "\$(date -u +%Y-%m-%dT%H:%M:%S.000Z)", "source": "install" },
   "database": {
     "mode": "embedded-postgres",
-    "embeddedPostgresDataDir": "/home/paper/.paperclip/instances/default/db",
+    "embeddedPostgresDataDir": "/home/${CI_USER}/.paperclip/instances/default/db",
     "embeddedPostgresPort": 54329,
     "backup": {
       "enabled": true,
       "intervalMinutes": 60,
       "retentionDays": 30,
-      "dir": "/home/paper/.paperclip/instances/default/data/backups"
+      "dir": "/home/${CI_USER}/.paperclip/instances/default/data/backups"
     }
   },
   "logging": {
     "mode": "file",
-    "logDir": "/home/paper/.paperclip/instances/default/logs"
+    "logDir": "/home/${CI_USER}/.paperclip/instances/default/logs"
   },
   "server": {
     "deploymentMode": "authenticated",
@@ -168,36 +214,36 @@ cat > /home/paper/.paperclip/instances/default/config.json << CONFIG
   "storage": {
     "provider": "local_disk",
     "localDisk": {
-      "baseDir": "/home/paper/.paperclip/instances/default/data/storage"
+      "baseDir": "/home/${CI_USER}/.paperclip/instances/default/data/storage"
     }
   },
   "secrets": {
     "provider": "local_encrypted",
     "strictMode": false,
     "localEncrypted": {
-      "keyFilePath": "/home/paper/.paperclip/instances/default/secrets/master.key"
+      "keyFilePath": "/home/${CI_USER}/.paperclip/instances/default/secrets/master.key"
     }
   }
 }
 CONFIG
-chown paper:paper /home/paper/.paperclip/instances/default/config.json
+chown ${CI_USER}:${CI_USER} /home/${CI_USER}/.paperclip/instances/default/config.json
 
-# systemd service
+# ── systemd service ───────────────────────────────────────────
 cat > /etc/systemd/system/paperclip.service << SERVICE
 [Unit]
-Description=Paperclip
+Description=Paperclip AI
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=paper
-Group=paper
-WorkingDirectory=/home/paper/paperclip-src
-EnvironmentFile=/home/paper/.paperclip/instances/default/.env
+User=${CI_USER}
+Group=${CI_USER}
+WorkingDirectory=/home/${CI_USER}/paperclip-src
+EnvironmentFile=/home/${CI_USER}/.paperclip/instances/default/.env
 Environment=NODE_ENV=production
-Environment=PAPERCLIP_HOME=/home/paper/.paperclip
-Environment=PATH=/home/paper/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PAPERCLIP_HOME=/home/${CI_USER}/.paperclip
+Environment=PATH=/home/${CI_USER}/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/pnpm paperclipai run
 Restart=always
 RestartSec=5
@@ -207,25 +253,29 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 SERVICE
 
-# Alle rechte fuer paper
-chown -R paper:paper /home/paper/
-chmod -R 755 /home/paper/million
+# ── Permissions & start ───────────────────────────────────────
+chown -R ${CI_USER}:${CI_USER} /home/${CI_USER}/
+chmod -R 755 /home/${CI_USER}/million
 
 systemctl daemon-reload
 systemctl enable paperclip
 systemctl start paperclip
 
+VM_IP=\$(hostname -I | awk '{print \$1}')
+
 echo ""
 echo "==== PAPERCLIP INSTALL COMPLETE ===="
-echo "User:     paper"
-echo "Password: ${CI_PASSWORD}"
-echo "URL:      http://\$(hostname -I | awk '{print \$1}'):${PORT}"
-echo "Sudo:     NOPASSWD (volle rechte)"
+echo "User     : ${CI_USER}"
+echo "Password : ${CI_PASSWORD}"
+echo "URL      : http://\${VM_IP}:${PORT}"
+echo "Sudo     : NOPASSWD (full control)"
+echo "opencode : ${OPENCODE_VERSION}"
+echo "====================================="
 SETUP
 
-cp /tmp/paperclip-setup-$VMID.sh /var/lib/vz/snippets/paperclip-setup-$VMID.sh
+# ── Encode setup script into cloud-init userdata ──────────────
+SETUP_B64=$(base64 -w0 /tmp/paperclip-setup-"$VMID".sh)
 
-# Cloud-init userdata
 cat > "/var/lib/vz/snippets/paperclip-userdata-$VMID.yml" << USERDATA
 #cloud-config
 package_update: false
@@ -234,9 +284,8 @@ package_upgrade: false
 write_files:
   - path: /root/paperclip-setup.sh
     permissions: '0755'
-    source:
-      encoding: b64
-      content: $(base64 -w0 /tmp/paperclip-setup-$VMID.sh)
+    encoding: b64
+    content: ${SETUP_B64}
 
 runcmd:
   - bash /root/paperclip-setup.sh
@@ -244,22 +293,37 @@ USERDATA
 
 qm set "$VMID" --cicustom "user=local:snippets/paperclip-userdata-$VMID.yml"
 
-# VM starten
-echo "[6/7] Starting VM..."
+# ── Start VM ──────────────────────────────────────────────────
+echo "[6/7] Starting VM $VMID..."
 qm start "$VMID"
+
+# ── Save credentials locally ──────────────────────────────────
+CREDS_FILE="/root/paperclip-vm-$VMID-credentials.txt"
+cat > "$CREDS_FILE" << CREDS
+PAPERCLIP VM $VMID - $(date -u)
+================================
+VMID     : $VMID
+Name     : $VMNAME
+User     : $CI_USER
+Password : $CI_PASSWORD
+Port     : $PORT
+IP       : $IPCONFIG0
+Auth     : BETTER_AUTH_SECRET saved in VM at /home/$CI_USER/.paperclip/instances/default/.env
+CREDS
+chmod 600 "$CREDS_FILE"
 
 echo "[7/7] Done!"
 echo ""
-echo "========================================"
-echo " VM $VMID ($VMNAME) gestartet!"
-echo " Cloud-init laeuft ~8-10 Min im Hintergrund"
+echo "════════════════════════════════════════"
+echo "  VM $VMID ($VMNAME) is starting"
+echo "  Cloud-init takes ~8-10 minutes"
 echo ""
-echo " Status pruefen (nach ~10 Min):"
-echo "   qm guest exec $VMID -- cat /root/paperclip-install-result.txt"
+echo "  Check install log (after ~10 min):"
+echo "    qm guest exec $VMID -- cat /root/paperclip-install-result.txt"
 echo ""
-echo " Console:"
-echo "   qm terminal $VMID"
+echo "  Open console:"
+echo "    qm terminal $VMID"
 echo ""
-echo " Paperclip URL (nach Install):"
-echo "   http://<VM-IP>:${PORT}"
-echo "========================================"
+echo "  Credentials saved to:"
+echo "    $CREDS_FILE"
+echo "════════════════════════════════════════"
